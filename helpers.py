@@ -1,5 +1,8 @@
 import cv2
 import numpy as np
+import time
+from PIL import Image
+
 
 def preprocess(gray, th_w, th_h):
     """
@@ -24,6 +27,9 @@ def middle_vector(binary):  # binary: 0/255, white = line
     if M["m00"] == 0:
         raise ValueError("No white pixels found")
 
+    ## if there is a lot of noise, consider filtering by area first
+    if M["m00"] > 100:
+        ROI = Left side
     # m10 = suma de las coordinadas horizontales
     # m01 = suma de las coordinadas verticales
     cx = M["m10"] / M["m00"]
@@ -113,8 +119,9 @@ def get_W(angles, radius, dx, dy, linearSpeed, angularVelocity, wheelRadius):
   return w
 
 
-def capture_frame_gray():
-    raise NotImplementedError
+def capture_frame_gray(picam2):
+    return
+    picam2.capture_array()
 
 def apply_wheel_speeds(w):
     raise NotImplementedError
