@@ -1,19 +1,49 @@
-
 from picamera2 import Picamera2, Preview
 import cv2
 import numpy as np
 import time
+import RPi.GPIO as GPIO
 import os
+import shutil
+
 
 class Robot():
 
     def __init__(self):
         
+        self.ena, self.in1, self.in2 = 18, 23, 24  # Motor 1
+        self.enb, self.in3, self.in4 = 19, 5, 6    # Motor 2
+        self.enc, self.in5, self.in6 = 13, 16, 26  # Motor 3
+        
+        ## set pins
+        GPIO.setmode(GPIO.BCM)
+        pins = [self.ena, self.in1, self.in2, 
+                self.enb, self.in3, self.in4, 
+                self.enc, self.in5, self.in6]
+        GPIO.setup(pins, GPIO.OUT)
+        
+        self.pwm_a = GPIO.PWM(self.ena, 42000)
+        self.pwm_b = GPIO.PWM(self.enb, 42000)
+        self.pwm_c = GPIO.PWM(self.enc, 42000)
+        
+        self.pwm_a.start(0)
+        self.pwm_b.start(0)
+        self.pwm_c.start(0)
+        
+        # okay
+        self.max_physical_speed = 1.0 
+        
+        # dont judge, just enjoy :D
+        self.motor1 = [self.pwm_a, self.in1, self.in2]
+        self.motor2 = [self.pwm_b, self.in3, self.in4]
+        self.motor3 = [self.pwm_c, self.in5, self.in6]     
+        self.motors = [self.motor1, self.motor2, self.motor3]
 
         # -- Debugging --
         self.frame_count = 0
         self.debug_save_dir = "debug_frames" # Folder to save images in
-
+        self._clean_debug_dir()
+        
         # -- Constants --
         self.angles = np.deg2rad([90, 210, 330])    # angles of the weels
         self.linearSpeed = 0.8                      # m/s linear speed along (dx,dy)
@@ -27,24 +57,32 @@ class Robot():
         self.cy = 0
         self.dx = 0
         self.dy = 0
-
+        
+        # PID constants
+        self.kp = 0.05
+        self.ki = 0.0
+        self.kd = 0.1
+        self.prev_error = 0
+        self.integral = 0
+        self.last_time = time.time()
+        
         # camera configuration
         self.camera = self.configure_camera()
-
+    
     def configure_camera(self):
-            picam2 = Picamera2()
-            picam2.start_preview(Preview.NULL)
-            capture_config = picam2.create_still_configuration()
-            picam2.configure(capture_config)
-            picam2.start()
+        picam2 = Picamera2()  
+        picam2.start_preview(Preview.NULL)  
+        capture_config = picam2.create_still_configuration(main={"size": (320, 240)})  
+        picam2.configure(capture_config)
+        picam2.start()
 
-            time.sleep(2)
-            with picam2.controls as ctrl:
-                ctrl.AnalogueGain = 1.0
-                ctrl.ExposureTime = 400000
-            time.sleep(2)
+        time.sleep(1)
+        with picam2.controls as ctrl:
+            ctrl.AnalogueGain = 1.0
+            ctrl.ExposureTime = 50000
+        time.sleep(1)
 
-            return picam2
+        return picam2
     
     def preprocess_image(self, gray, th_w, th_h):
         """
@@ -54,15 +92,20 @@ class Robot():
         # binv = cv2.morphologyEx(binv, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), 1)
         """
 
-        # TODO ensure shape and format of gray
         h, w = gray.shape[:2]
         roi = gray[int(h*th_h):h, int(w*th_w):int(w-w*th_w)]
+        
         # Correct unpacking order
-        _, binv = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-        # binv = cv2.morphologyEx(binv, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
-        # binv = cv2.morphologyEx(binv, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
-
+        roi = cv2.GaussianBlur(roi, (5, 5), 0)
+        
+        # 2. Adaptive Threshold (Keep existing logic)
+        binv = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,\
+            cv2.THRESH_BINARY_INV, 101, 2)
+        
+        # 3. Morphological CLOSE to fill black "holes" inside the white line
+        # This fixes the "hollow" line issue
+        kernel = np.ones((5,5), np.uint8)
+        binv = cv2.morphologyEx(binv, cv2.MORPH_CLOSE, kernel)
         return binv, roi
 
     def middle_vector(self, binary):  # binary: 0/255, white = line
@@ -71,9 +114,6 @@ class Robot():
         if M["m00"] == 0:
             raise ValueError("No white pixels found")
 
-        ## if there is a lot of noise, consider filtering by area first
-        # if M["m00"] > 100:
-                # TODO Compute intersection movement
         # m10 = suma de las coordinadas horizontales
         # m01 = suma de las coordinadas verticales
         cx = M["m10"] / M["m00"]
@@ -93,41 +133,6 @@ class Robot():
 
         return cx, cy, dx, dy
 
-    def draw_middle_vector(self, image, center, direction, scale=100, color=(0,255,0), thickness=2):
-        """
-        Draw the middle vector (principal axis) on an image.
-
-        Parameters:
-            image: np.ndarray (grayscale or BGR)
-            center: (cx, cy) tuple from middle_vector()
-            direction: (vx, vy) tuple, unit vector along main axis
-            scale: length of the arrow to draw (in pixels)
-            color: arrow color (BGR)
-            thickness: line thickness
-
-        Returns:
-            A copy of the image with the vector drawn on it.
-        """
-        # ensure we are drawing on a color image
-        if len(image.shape) == 2:
-            vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        else:
-            vis = image.copy()
-
-        cx, cy = center
-        vx, vy = direction
-
-        # arrow endpoints (two directions from the center)
-        pt1 = (int(cx - vx * scale), int(cy - vy * scale))
-        pt2 = (int(cx + vx * scale), int(cy + vy * scale))
-
-        # draw the main line (green)
-        cv2.arrowedLine(vis, pt2, pt1, color, thickness, tipLength=0.2)
-
-        # mark the centroid (red dot)
-        cv2.circle(vis, (int(cx), int(cy)), 4, (0,0,255), -1)
-
-        return vis
 
     def draw_debug_info(self, image: np.ndarray, cx: float, cy: float, dx: float, dy: float) -> np.ndarray:
         """
@@ -143,8 +148,8 @@ class Robot():
         cx_int, cy_int = int(cx), int(cy)
         cv2.circle(debug_img, (cx_int, cy_int), 5, (0, 0, 255), -1) # Red centroid
 
-        p2_x = int(cx_int + dx * 50) # Scale the vector by 50px
-        p2_y = int(cy_int + dy * 50)
+        p2_x = int(cx_int + dx * 250) # Scale the vector by 50px
+        p2_y = int(cy_int + dy * 250)
         cv2.line(debug_img, (cx_int, cy_int), (p2_x, p2_y), (255, 0, 0), 2) # Blue line
         
         return debug_img
@@ -197,17 +202,78 @@ class Robot():
         w = (M @ v) / self.wheelRadius
         print("wheel speeds:", w)
         return w
-
     
+    def pid_correction(self, error):
+        current_time = time.time()
+        delta_time = current_time - self.last_time
+        
+        # Avoid division by zero on first run
+        if delta_time <= 0:
+            delta_time = 0.001
 
+        # 1. Proportional term
+        P = self.kp * error
+
+        # 2. Integral term (accumulation of error)
+        self.integral += error * delta_time
+        I = self.ki * self.integral
+
+        # 3. Derivative term (rate of change)
+        delta_error = error - self.prev_error
+        D = self.kd * (delta_error / delta_time)
+
+        # Update state for next loop
+        self.prev_error = error
+        self.last_time = current_time
+
+        return P + I + D
+    
     def capture_frame_gray(self):
         im = self.camera.capture_array()
         grey = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
         self.camera.capture_file("demo.jpg")
         return grey
+    
+    def _clean_debug_dir(self):
+        """Deletes the debug directory and recreates it empty."""
+        if os.path.exists(self.debug_save_dir):
+            shutil.rmtree(self.debug_save_dir)  # Deletes dir and all contents
+        os.makedirs(self.debug_save_dir, exist_ok=True) # Creates fresh dir
+        print(f"[INFO] Cleared and renewed debug directory: {self.debug_save_dir}")
+    
+    def set_single_motor(self, pwm_obj, in_x, in_y, speed):
+        """Helper to set one motor's speed (-100 to 100)"""
+        speed = max(min(speed, 100), -100) # Clamp
+        
+        if speed >= 0:
+            GPIO.output(in_x, GPIO.HIGH)
+            GPIO.output(in_y, GPIO.LOW)
+            pwm_obj.ChangeDutyCycle(speed)
+        else:
+            GPIO.output(in_x, GPIO.LOW)
+            GPIO.output(in_y, GPIO.HIGH)
+            pwm_obj.ChangeDutyCycle(abs(speed))
+    
+    # digitaloutout device inpins x2 , on or of freq 42k | set duty cycle, value 0.5 + pid
+    def apply_wheel_speeds(self, w):
+        """
+        Takes the calculated wheel speeds (w), normalizes them, 
+        and sends PWM signals to the motors.
+        """
+        print(f"Target Speeds: {w}")
 
-    def apply_wheel_speeds(self):
-        raise NotImplementedError
+        for motor_info, speed in zip(self.motors, w):
+            pwm_val = (speed / self.max_physical_speed) * 100
+            
+            # motor_info = [pwm_object, pin_a, pin_b]
+            self.set_single_motor(motor_info[0], motor_info[1], motor_info[2], pwm_val)
+        
+        
+    def stop_all(self):
+        for motor in self.motors:
+            motor.stop()
+        self.camera.stop()
+
 
     def run(self):
         while True:
@@ -216,13 +282,10 @@ class Robot():
             
             # --- 1. Get Image ---
             img_gray = self.capture_frame_gray()
-            
-            # --- 2. Preprocess ---
-            mask, roi = self.preprocess_image(img_gray, th_w=0.35, th_h=0.6)
-            
-            debug_overlay = None # Placeholder
+            mask, roi = self.preprocess_image(img_gray, th_w=0.35, th_h=0.1)
             
             # --- 3. Handle line detection ---
+            debug_overlay = None 
             try:
                 cx, cy, dx, dy = self.middle_vector(mask)
                 self.cx = cx
@@ -251,10 +314,18 @@ class Robot():
                     save_dir=self.debug_save_dir,
                     frame_id=self.frame_count
                 )
+                
             
-            # --- 5. Direction ---
+            # how much have we moved from the center
+            error = 160 - self.cx
+            correction = self.pid_correction(error)
+            self.angularVelocity = -correction * 0.01
+
+            # with the corrected anculgar velocity, get wheel speeds
             w = self.get_motorW()
-            # apply_wheel_speeds(w)
+            
+            
+            self.apply_wheel_speeds(w)
 
 if __name__ == "__main__":  
     robot = Robot()
